@@ -330,12 +330,6 @@ def generate_briefing_message():
     """Sync wrapper for backward compatibility."""
     return asyncio.run(generate_briefing_message_async())
 
-        return "\n".join(lines)
-
-    except Exception as e:
-        logger.error(f"Failed to generate briefing: {e}")
-        return f"⚠️ 브리핑 생성 실패: {e}"
-
 
 async def send_briefing():
     """Send morning briefing via Telegram."""
