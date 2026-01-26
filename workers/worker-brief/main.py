@@ -221,8 +221,8 @@ async def generate_briefing_message_async():
         today = str(datetime.date.today())
         yesterday = str(datetime.date.today() - datetime.timedelta(days=1))
 
-        # Use yesterday's sleep data (sleep is recorded for previous night)
-        sleep_data = health.get(yesterday, health.get(today, {}))
+        # Use today's row for sleep (Garmin sync stores last night's sleep on today's date)
+        sleep_data = health.get(today, health.get(yesterday, {}))
         today_data = health.get(today, {})
 
         # Build message
@@ -249,7 +249,7 @@ async def generate_briefing_message_async():
         if sleep_data:
             sleep_hours = sleep_data.get('sleep_hours', 0)
             sleep_score = sleep_data.get('sleep_score', 0)
-            lines.append(f"😴 *어제 수면*: {sleep_hours}시간 (점수: {sleep_score})")
+            lines.append(f"😴 *수면*: {sleep_hours}시간 (점수: {sleep_score})")
         else:
             lines.append("😴 *수면 데이터*: 없음")
 
