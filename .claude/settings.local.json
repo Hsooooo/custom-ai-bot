@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.clawd.bot)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:kristianfreeman.com)"
+    ]
+  }
+}
