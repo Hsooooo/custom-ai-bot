@@ -1,0 +1,5 @@
+# IntelliJ / JetBrains
+.idea/
+
+# swap files
+*.swp

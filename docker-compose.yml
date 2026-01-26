@@ -1,0 +1,119 @@
+version: '3.8'
+
+services:
+  # ---------------------------------------------------------------------------
+  # Core Infrastructure
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432" # Optional: Expose if you want to connect from local host
+    networks:
+      - clawd_net
+
+  redis:
+    image: redis:alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - clawd_net
+
+  # ---------------------------------------------------------------------------
+  # Bot Gateway
+  # ---------------------------------------------------------------------------
+  clawd:
+    build: ./clawd
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      - TZ=${TZ}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    networks:
+      - clawd_net
+
+  # ---------------------------------------------------------------------------
+  # Workers
+  # ---------------------------------------------------------------------------
+  worker-garmin:
+    build: ./workers/worker-garmin
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - TZ=${TZ}
+      - GARMIN_EMAIL=${GARMIN_EMAIL}
+      - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+    volumes:
+      - ./obsidian_vault:/obsidian # To write Health md files
+    networks:
+      - clawd_net
+
+  worker-brief:
+    build: ./workers/worker-brief
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - TZ=${TZ}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    networks:
+      - clawd_net
+
+  worker-notes:
+    build: ./workers/worker-notes
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - TZ=${TZ}
+    volumes:
+      - ./obsidian_vault:/obsidian
+    networks:
+      - clawd_net
+
+  worker-monitor:
+    build: ./workers/worker-monitor
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # To monitor docker containers
+    networks:
+      - clawd_net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+
+networks:
+  clawd_net:
+    driver: bridge

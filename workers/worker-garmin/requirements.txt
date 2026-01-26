@@ -1,0 +1,7 @@
+garminconnect>=0.2.38
+garth>=0.4.40
+psycopg2-binary
+pandas
+schedule
+python-dotenv
+python-telegram-bot==20.7
