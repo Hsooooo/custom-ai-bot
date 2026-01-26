@@ -21,9 +21,9 @@ triggers:
 When the user asks about health data:
 
 1. **Identify the query type**:
-   - Sleep data → `python /app/workers/worker-brief/query.py health --days 3`
-   - Exercise data → `python /app/workers/worker-brief/query.py exercise --days 7`
-   - Full briefing → `python /app/workers/worker-brief/query.py briefing`
+   - Sleep data → `docker exec custom-ai-bot-worker-brief-1 python /app/query.py health --days 3`
+   - Exercise data → `docker exec custom-ai-bot-worker-brief-1 python /app/query.py exercise --days 7`
+   - Full briefing → `docker exec custom-ai-bot-worker-brief-1 python /app/query.py briefing`
 
 2. **For specific dates**:
    - "어제" → `--date $(date -d "yesterday" +%Y-%m-%d)`
@@ -39,16 +39,16 @@ When the user asks about health data:
 
 ```bash
 # Get today's health data
-python /app/workers/worker-brief/query.py health
+docker exec custom-ai-bot-worker-brief-1 python /app/query.py health
 
 # Get last 7 days
-python /app/workers/worker-brief/query.py health --days 7
+docker exec custom-ai-bot-worker-brief-1 python /app/query.py health --days 7
 
 # Get exercise history
-python /app/workers/worker-brief/query.py exercise --days 7 --limit 5
+docker exec custom-ai-bot-worker-brief-1 python /app/query.py exercise --days 7 --limit 5
 
 # Full text briefing
-python /app/workers/worker-brief/query.py briefing
+docker exec custom-ai-bot-worker-brief-1 python /app/query.py briefing
 ```
 
 ## Response Guidelines
