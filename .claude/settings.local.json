@@ -4,7 +4,13 @@
       "WebSearch",
       "WebFetch(domain:docs.clawd.bot)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:kristianfreeman.com)"
+      "WebFetch(domain:kristianfreeman.com)",
+      "Bash(curl:*)",
+      "Skill(hud)",
+      "Bash(chmod:*)",
+      "Bash(npm install:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }
