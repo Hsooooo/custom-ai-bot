@@ -125,6 +125,13 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+
+    # Ensure missing columns exist (for migration)
+    cur.execute("ALTER TABLE exercise_activity ADD COLUMN IF NOT EXISTS activity_name TEXT;")
+    cur.execute("ALTER TABLE exercise_activity ADD COLUMN IF NOT EXISTS avg_hr INTEGER;")
+    cur.execute("ALTER TABLE exercise_activity ADD COLUMN IF NOT EXISTS max_hr INTEGER;")
+    cur.execute("ALTER TABLE exercise_activity ADD COLUMN IF NOT EXISTS avg_pace TEXT;")
+    cur.execute("ALTER TABLE exercise_activity ADD COLUMN IF NOT EXISTS elevation_gain NUMERIC;")
     
     conn.commit()
     cur.close()
