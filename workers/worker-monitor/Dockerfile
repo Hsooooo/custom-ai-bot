@@ -1,3 +1,9 @@
 FROM python:3.10-slim
 WORKDIR /app
-CMD ["python", "-c", "print('Service stub started'); import time; time.sleep(3600)"]
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+
+CMD ["python", "main.py"]

@@ -43,6 +43,7 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
     networks:
       - clawd_net
 
@@ -54,6 +55,7 @@ services:
     restart: unless-stopped
     depends_on:
       - postgres
+      - redis
     environment:
       - TZ=${TZ}
       - GARMIN_EMAIL=${GARMIN_EMAIL}
@@ -64,6 +66,7 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+      - REDIS_HOST=redis
     volumes:
       - ./obsidian_vault:/obsidian # To write Health md files
     networks:
@@ -74,6 +77,7 @@ services:
     restart: unless-stopped
     depends_on:
       - postgres
+      - redis
     environment:
       - TZ=${TZ}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
@@ -82,6 +86,16 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - REDIS_HOST=redis
+      # External Services
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - OPENWEATHER_CITY=${OPENWEATHER_CITY:-Seoul}
+      - GOOGLE_CALENDAR_API_KEY=${GOOGLE_CALENDAR_API_KEY}
+      - GOOGLE_CALENDAR_ID=${GOOGLE_CALENDAR_ID}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - GITHUB_USERNAME=${GITHUB_USERNAME}
+    volumes:
+      - ./workers/shared:/app/shared:ro
     networks:
       - clawd_net
 
@@ -92,6 +106,11 @@ services:
       - postgres
     environment:
       - TZ=${TZ}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - OBSIDIAN_PATH=/obsidian
     volumes:
       - ./obsidian_vault:/obsidian
     networks:
@@ -104,6 +123,9 @@ services:
       - TZ=${TZ}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+      - DISK_THRESHOLD_PERCENT=${DISK_THRESHOLD_PERCENT:-85}
+      - MEMORY_THRESHOLD_PERCENT=${MEMORY_THRESHOLD_PERCENT:-85}
+      - CONTAINER_RESTART_THRESHOLD=${CONTAINER_RESTART_THRESHOLD:-3}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # To monitor docker containers
     networks:
@@ -117,3 +139,4 @@ volumes:
 networks:
   clawd_net:
     driver: bridge
+

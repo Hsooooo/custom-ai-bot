@@ -1,6 +1,3 @@
 python-telegram-bot==20.7
-psycopg2-binary
+docker
 schedule
-pytz
-httpx
-redis

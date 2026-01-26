@@ -10,13 +10,17 @@
 - [x] Obsidian 마크다운 자동 생성
 - [x] 텔레그램 봇 기본 명령어 (`/status`, `/brief`)
 - [x] Docker Compose 오케스트레이션
+- [x] 운동 활동 데이터 수집 (`exercise_activity` 테이블)
+- [x] worker-brief (아침 브리핑 + 외부 서비스 연동)
+- [x] worker-notes (Obsidian 노트 관리)
+- [x] worker-monitor (컨테이너 모니터링)
+- [x] Redis 활용 (캐싱, Rate Limiting, 작업 큐)
 
-### 미구현 (Stub)
-- [ ] 운동 활동 데이터 수집 (`exercise_activity` 테이블 미사용)
-- [ ] worker-brief (아침 브리핑)
-- [ ] worker-notes (Obsidian 노트 관리)
-- [ ] worker-monitor (컨테이너 모니터링)
-- [ ] Redis 활용
+### 미구현
+- [ ] AI 기반 인사이트 (Phase 3)
+- [ ] 예측 알림 (Phase 3)
+- [ ] 음성 인터페이스 (Phase 3)
+- [ ] 웹 대시보드 (Phase 3)
 
 ---
 
@@ -106,29 +110,69 @@ tests/
 
 ---
 
-## Phase 2: 중기 계획
+## Phase 2: 중기 계획 (완료)
 
-### 2.1 외부 서비스 연동
-| 서비스 | 용도 | 우선순위 |
-|--------|------|----------|
-| Google Calendar | 일정 조회 → 브리핑 포함 | 높음 |
-| Weather API | 날씨 정보 → 브리핑 포함 | 높음 |
-| GitHub | 커밋/PR 현황 → 개발 브리핑 | 중간 |
+### 2.1 외부 서비스 연동 ✅
+| 서비스 | 용도 | 상태 |
+|--------|------|------|
+| OpenWeatherMap | 날씨 정보 → 브리핑 포함 | ✅ 완료 |
+| Google Calendar | 일정 조회 → 브리핑 포함 | ✅ 완료 |
+| GitHub | 커밋/PR 현황 → 개발 브리핑 | ✅ 완료 |
 
-### 2.2 Redis 활용
-- 최근 조회 데이터 캐싱
-- Garmin API Rate Limiting 대응
-- 작업 큐 (비동기 처리)
+**구현 내용**:
+- `external_services.py`: 외부 API 통합 모듈
+- 비동기 HTTP 클라이언트 (httpx)
+- 날씨, 일정, GitHub 활동 정보 브리핑에 포함
 
-### 2.3 worker-notes 구현
-- Obsidian 데일리 노트 자동 생성
-- 템플릿 기반 노트 구조화
-- 태그 자동 추가
+### 2.2 Redis 활용 ✅
+**구현 내용**:
+- `redis_utils.py`: Redis 유틸리티 모듈
+- 캐싱: 외부 API 응답 캐싱 (TTL 기반)
+- Rate Limiting: API 호출 제한 (Token Bucket)
+- Job Queue: 비동기 작업 처리
 
-### 2.4 worker-monitor 구현
-- Docker 컨테이너 헬스 체크
-- 디스크/메모리 사용량 모니터링
-- 이상 감지 시 알림
+**캐시 키**:
+- `cache:weather` - 30분 TTL
+- `cache:github` - 15분 TTL
+- `cache:calendar` - 5분 TTL
+
+### 2.3 worker-notes 구현 ✅
+**목표**: Obsidian 노트 자동화
+
+**구현 내용**:
+- 매일 00:05 데일리 노트 자동 생성
+- 일요일 21:00 위클리 리뷰 자동 생성
+- 템플릿 변수 치환 (`{{date:YYYY-MM-DD}}` 등)
+- 건강 데이터 자동 삽입
+- 최근 운동 활동 포함
+
+**노트 구조**:
+```
+obsidian_vault/
+├── Daily/
+│   └── 2026-01-26.md
+├── Weekly/
+│   └── 2026-W04.md
+└── templates/
+    ├── Daily_Template.md
+    └── Weekly_Template.md
+```
+
+### 2.4 worker-monitor 구현 ✅
+**목표**: 시스템 모니터링 및 알림
+
+**구현 내용**:
+- Docker 컨테이너 상태 모니터링
+- 디스크/메모리 사용량 체크
+- 5분마다 헬스 체크
+- 매일 09:00 헬스 리포트
+- 이상 감지 시 텔레그램 알림
+
+**모니터링 항목**:
+- 컨테이너 상태 (running, exited, unhealthy)
+- 컨테이너 재시작 횟수
+- 디스크 사용량 (기본 85% 임계값)
+- 메모리 사용량 (기본 85% 임계값)
 
 ---
 
@@ -180,8 +224,11 @@ tests/
 | M2: 아침 브리핑 | worker-brief 완성 | ✅ 완료 |
 | M3: 테스트 | 핵심 기능 테스트 커버리지 70% | ✅ 완료 |
 | M4: 안정화 | 에러 핸들링 및 모니터링 | ✅ 완료 |
-| M5: 외부 연동 | Calendar + Weather 연동 | ⏳ 대기 |
-| M6: AI 인사이트 | 트렌드 분석 기능 | ⏳ 대기 |
+| M5: 외부 연동 | Calendar + Weather + GitHub 연동 | ✅ 완료 |
+| M6: Redis | 캐싱, Rate Limiting, Job Queue | ✅ 완료 |
+| M7: 노트 자동화 | worker-notes 완성 | ✅ 완료 |
+| M8: 시스템 모니터링 | worker-monitor 완성 | ✅ 완료 |
+| M9: AI 인사이트 | 트렌드 분석 기능 | ⏳ 대기 |
 
 ---
 

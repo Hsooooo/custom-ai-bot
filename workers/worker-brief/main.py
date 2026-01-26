@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 import datetime
@@ -7,6 +8,9 @@ import psycopg2
 import schedule
 import pytz
 from telegram import Bot
+
+# Add shared modules to path
+sys.path.insert(0, '/app/shared')
 
 # Configure Logging
 logging.basicConfig(
@@ -23,6 +27,29 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "clawd_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "clawd_user")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
 TZ = os.getenv("TZ", "Asia/Seoul")
+
+# Import external services
+try:
+    from external_services import (
+        get_weather, format_weather,
+        get_calendar_events, format_calendar_events,
+        get_github_activity, format_github_activity
+    )
+    EXTERNAL_SERVICES_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"External services not available: {e}")
+    EXTERNAL_SERVICES_AVAILABLE = False
+
+# Import Redis utilities
+try:
+    from redis_utils import (
+        is_redis_available, cache_get, cache_set,
+        CacheKeys, weather_limiter, github_limiter
+    )
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    logger.warning("Redis utilities not available")
 
 
 def get_db_connection():
@@ -116,11 +143,80 @@ def format_duration(seconds):
     return f"{minutes}m"
 
 
-def generate_briefing_message():
-    """Generate morning briefing message."""
+async def get_external_data():
+    """Fetch all external service data concurrently."""
+    weather_data = None
+    calendar_events = []
+    github_activity = {}
+    
+    if not EXTERNAL_SERVICES_AVAILABLE:
+        return weather_data, calendar_events, github_activity
+    
+    try:
+        # Check rate limits and cache
+        tasks = []
+        
+        # Weather (with caching)
+        if REDIS_AVAILABLE and is_redis_available():
+            cached_weather = cache_get(CacheKeys.WEATHER)
+            if cached_weather:
+                weather_data = cached_weather
+            elif weather_limiter.allow():
+                tasks.append(('weather', get_weather()))
+        else:
+            tasks.append(('weather', get_weather()))
+        
+        # Calendar
+        tasks.append(('calendar', get_calendar_events()))
+        
+        # GitHub (with rate limiting)
+        if REDIS_AVAILABLE and is_redis_available():
+            cached_github = cache_get(CacheKeys.GITHUB)
+            if cached_github:
+                github_activity = cached_github
+            elif github_limiter.allow():
+                tasks.append(('github', get_github_activity()))
+        else:
+            tasks.append(('github', get_github_activity()))
+        
+        # Execute tasks concurrently
+        if tasks:
+            results = await asyncio.gather(
+                *[task[1] for task in tasks],
+                return_exceptions=True
+            )
+            
+            for i, (name, _) in enumerate(tasks):
+                result = results[i]
+                if isinstance(result, Exception):
+                    logger.error(f"Failed to fetch {name}: {result}")
+                    continue
+                
+                if name == 'weather' and result:
+                    weather_data = result
+                    if REDIS_AVAILABLE and is_redis_available():
+                        cache_set(CacheKeys.WEATHER, result, ttl_seconds=1800)  # 30 min
+                elif name == 'calendar':
+                    calendar_events = result or []
+                elif name == 'github' and result:
+                    github_activity = result
+                    if REDIS_AVAILABLE and is_redis_available():
+                        cache_set(CacheKeys.GITHUB, result, ttl_seconds=900)  # 15 min
+        
+    except Exception as e:
+        logger.error(f"Error fetching external data: {e}")
+    
+    return weather_data, calendar_events, github_activity
+
+
+async def generate_briefing_message_async():
+    """Generate morning briefing message with external data."""
     try:
         health = get_health_data()
         activities = get_recent_activities(3)
+        
+        # Fetch external data
+        weather_data, calendar_events, github_activity = await get_external_data()
 
         today = str(datetime.date.today())
         yesterday = str(datetime.date.today() - datetime.timedelta(days=1))
@@ -130,7 +226,24 @@ def generate_briefing_message():
         today_data = health.get(today, {})
 
         # Build message
-        lines = ["🌅 *Good Morning!*\n"]
+        tz = pytz.timezone(TZ)
+        now = datetime.datetime.now(tz)
+        is_morning = now.hour < 12
+        
+        if is_morning:
+            lines = ["🌅 *Good Morning!*\n"]
+        else:
+            lines = ["🌙 *Evening Summary*\n"]
+
+        # Weather section (NEW)
+        if EXTERNAL_SERVICES_AVAILABLE and weather_data:
+            lines.append(format_weather(weather_data))
+            lines.append("")
+        
+        # Calendar section (NEW)
+        if EXTERNAL_SERVICES_AVAILABLE and calendar_events:
+            lines.append(format_calendar_events(calendar_events))
+            lines.append("")
 
         # Sleep summary
         if sleep_data:
@@ -190,6 +303,13 @@ def generate_briefing_message():
 
                 lines.append(f"  {emoji} {act_date} {act.get('name', act['type'])}: {detail}")
 
+        # GitHub activity (NEW)
+        if EXTERNAL_SERVICES_AVAILABLE and github_activity:
+            github_str = format_github_activity(github_activity)
+            if github_str:
+                lines.append("")
+                lines.append(github_str)
+
         # Add motivational note based on data
         lines.append("\n---")
         if today_data and today_data.get('body_battery_max', 0) >= 80:
@@ -206,6 +326,17 @@ def generate_briefing_message():
         return f"⚠️ 브리핑 생성 실패: {e}"
 
 
+def generate_briefing_message():
+    """Sync wrapper for backward compatibility."""
+    return asyncio.run(generate_briefing_message_async())
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Failed to generate briefing: {e}")
+        return f"⚠️ 브리핑 생성 실패: {e}"
+
+
 async def send_briefing():
     """Send morning briefing via Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
@@ -214,14 +345,14 @@ async def send_briefing():
 
     try:
         bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        message = generate_briefing_message()
+        message = await generate_briefing_message_async()
 
         await bot.send_message(
             chat_id=TELEGRAM_ADMIN_ID,
             text=message,
             parse_mode='Markdown'
         )
-        logger.info("Morning briefing sent successfully.")
+        logger.info("Briefing sent successfully.")
 
     except Exception as e:
         logger.error(f"Failed to send briefing: {e}")
@@ -234,6 +365,23 @@ def run_briefing():
 
 def main():
     logger.info("Worker Brief started.")
+    
+    # Log external service status
+    if EXTERNAL_SERVICES_AVAILABLE:
+        logger.info("External services: Weather, Calendar, GitHub - Available")
+    else:
+        logger.warning("External services: Not available")
+    
+    if REDIS_AVAILABLE:
+        try:
+            if is_redis_available():
+                logger.info("Redis: Connected")
+            else:
+                logger.warning("Redis: Not available")
+        except:
+            logger.warning("Redis: Not available")
+    else:
+        logger.warning("Redis: Not available")
 
     # Wait for other services
     time.sleep(15)
