@@ -107,7 +107,7 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS exercise_activity (
             activity_id BIGINT PRIMARY KEY,
@@ -123,6 +123,25 @@ def init_db():
             elevation_gain NUMERIC,
             raw_data JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+
+    # Per-lap (split) data (1km laps etc.)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS exercise_lap (
+            activity_id BIGINT NOT NULL,
+            lap_index INTEGER NOT NULL,
+            start_time_gmt TIMESTAMP,
+            distance_meters NUMERIC,
+            duration_sec NUMERIC,
+            avg_speed_mps NUMERIC,
+            avg_pace TEXT,
+            avg_hr INTEGER,
+            max_hr INTEGER,
+            calories NUMERIC,
+            raw_data JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (activity_id, lap_index)
         );
     """)
 
@@ -214,11 +233,60 @@ def save_activity(activity):
     logger.info(f"Saved activity {activity_id}: {activity.get('activity_name')}")
 
 
+def save_activity_laps(activity_id: int, laps: list[dict]):
+    """Upsert per-lap splits for an activity."""
+    if not laps:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    for idx, lap in enumerate(laps, start=1):
+        # Garmin returns lap duration in seconds (float) and distance in meters
+        avg_speed = lap.get('averageSpeed')
+        avg_pace = format_pace(avg_speed) if avg_speed else None
+
+        cur.execute("""
+            INSERT INTO exercise_lap (
+                activity_id, lap_index, start_time_gmt,
+                distance_meters, duration_sec, avg_speed_mps, avg_pace,
+                avg_hr, max_hr, calories, raw_data
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (activity_id, lap_index) DO UPDATE SET
+                start_time_gmt = EXCLUDED.start_time_gmt,
+                distance_meters = EXCLUDED.distance_meters,
+                duration_sec = EXCLUDED.duration_sec,
+                avg_speed_mps = EXCLUDED.avg_speed_mps,
+                avg_pace = EXCLUDED.avg_pace,
+                avg_hr = EXCLUDED.avg_hr,
+                max_hr = EXCLUDED.max_hr,
+                calories = EXCLUDED.calories,
+                raw_data = EXCLUDED.raw_data;
+        """, (
+            activity_id,
+            idx,
+            lap.get('startTimeGMT'),
+            lap.get('distance'),
+            lap.get('duration'),
+            avg_speed,
+            avg_pace,
+            lap.get('averageHR'),
+            lap.get('maxHR'),
+            lap.get('calories'),
+            Json(lap)
+        ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info(f"Saved {len(laps)} laps for activity {activity_id}")
+
+
 def format_pace(speed_mps):
     """Convert speed (m/s) to pace (min:sec/km)."""
     if not speed_mps or speed_mps <= 0:
         return None
-    pace_sec_per_km = 1000 / speed_mps
+    pace_sec_per_km = 1000 / float(speed_mps)
     minutes = int(pace_sec_per_km // 60)
     seconds = int(pace_sec_per_km % 60)
     return f"{minutes}:{seconds:02d}"
@@ -314,6 +382,14 @@ def sync_activities(client):
                 # Save to DB
                 save_activity(activity_data)
 
+                # Fetch + save per-lap splits (pace, HR per lap, etc.)
+                try:
+                    splits = client.get_activity_splits(activity_id)
+                    laps = splits.get('lapDTOs', []) if isinstance(splits, dict) else []
+                    save_activity_laps(activity_id, laps)
+                except Exception as e:
+                    logger.warning(f"Failed to fetch/save laps for activity {activity_id}: {e}")
+
                 # Generate markdown
                 generate_activity_markdown(activity_data)
 
@@ -357,18 +433,27 @@ Generated at {datetime.datetime.now().strftime("%H:%M:%S")}
     logger.info(f"Generated markdown for {date}")
 
 def login_garmin_with_retry():
-    """Login to Garmin Connect with retry logic."""
+    """Login to Garmin Connect with retry logic.
+
+    Important: do NOT call client.garth.load() directly.
+    garminconnect.Garmin.login(tokenstore=...) both loads tokens AND populates
+    client.display_name/full_name; without that, some endpoints (e.g. user summary)
+    will call /daily/None and return 403.
+    """
     import garth
+
     token_dir = "/app/.garth"
     os.makedirs(token_dir, exist_ok=True)
 
     client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
 
-    # Try loading existing session first
+    # Try loading existing session first (via Garmin.login so display_name is set)
     try:
-        client.garth.load(token_dir)
-        # Validate session by making a simple request
-        client.get_full_name()
+        client.login(tokenstore=token_dir)
+        if not getattr(client, "display_name", None):
+            raise RuntimeError("Garmin session loaded but display_name is empty")
+        # Validate session by hitting an authenticated endpoint
+        client.get_user_summary(datetime.date.today().isoformat())
         logger.info("Existing Garmin session loaded and validated.")
         return client
     except Exception as e:
@@ -381,6 +466,8 @@ def login_garmin_with_retry():
             logger.info(f"Attempting fresh Garmin login (attempt {attempt + 1}/{MAX_RETRIES})...")
             client.login()
             client.garth.dump(token_dir)
+            if not getattr(client, "display_name", None):
+                raise RuntimeError("Garmin login succeeded but display_name is empty")
             logger.info("New Garmin session saved.")
             return client
         except Exception as e:
@@ -427,14 +514,23 @@ def run_sync():
                     hrv_status = 'N/A'
 
                 # Extract stats
-                sleep_seconds = sleep_data.get('dailySleepDto', {}).get('sleepTimeSeconds', 0)
+                # NOTE: Garmin sleep payload key can be dailySleepDto (older) or dailySleepDTO (newer)
+                sleep_dto = sleep_data.get('dailySleepDto') or sleep_data.get('dailySleepDTO') or {}
+
+                sleep_seconds = sleep_dto.get('sleepTimeSeconds', 0) or 0
                 sleep_hours = round(sleep_seconds / 3600, 1)
-                sleep_score = sleep_data.get('dailySleepDto', {}).get('sleepScoreValue', 0)
-                
+
+                # Sleep score can vary by device/account; try common locations
+                sleep_score = (
+                    sleep_dto.get('sleepScoreValue')
+                    or (sleep_dto.get('sleepScores') or {}).get('overall', {}).get('value')
+                    or 0
+                )
+
                 stats = {
                     'date': sync_date_str,
                     'sleep_hours': sleep_hours,
-                    'sleep_score': sleep_score,
+                    'sleep_score': int(sleep_score) if sleep_score is not None else 0,
                     'resting_hr': summary.get('restingHeartRate', 0),
                     'hrv_status': hrv_status,
                     'stress_level': summary.get('averageStressLevel', 0),
