@@ -1,10 +1,19 @@
 import pytest
 import os
 import sys
+from unittest.mock import MagicMock
 
 # Add workers to path for testing
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'workers', 'worker-garmin'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'workers', 'worker-brief'))
+
+# Try importing redis, but it's optional for tests
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
 
 
 @pytest.fixture
@@ -64,3 +73,69 @@ def sample_user_summary():
             [1706241600000, 92]
         ]
     }
+
+
+# Agent-related fixtures
+
+@pytest.fixture
+def mock_redis():
+    """Mock Redis client for testing."""
+    if REDIS_AVAILABLE:
+        mock_client = MagicMock(spec=redis.Redis)
+    else:
+        mock_client = MagicMock()
+    mock_client.lrange.return_value = []
+    mock_client.lpush.return_value = 1
+    mock_client.ltrim.return_value = True
+    mock_client.expire.return_value = True
+    mock_client.delete.return_value = 1
+    return mock_client
+
+
+@pytest.fixture
+def sample_skill_content():
+    """Sample SKILL.md content for testing."""
+    return '''---
+name: test-skill
+description: Test skill for unit tests
+triggers:
+  - "test"
+  - "테스트"
+---
+
+## Instructions
+This is a test skill.
+
+## Examples
+- "Run test"
+- "테스트 실행"
+'''
+
+
+@pytest.fixture
+def sample_tool_definition():
+    """Sample tool definition for testing."""
+    return {
+        "name": "get_health_data",
+        "description": "Get health data from database",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {
+                    "type": "integer",
+                    "description": "Number of days to retrieve"
+                }
+            },
+            "required": []
+        }
+    }
+
+
+@pytest.fixture
+def sample_conversation_history():
+    """Sample conversation history for testing."""
+    return [
+        {"role": "user", "content": "안녕", "timestamp": 1000.0},
+        {"role": "assistant", "content": "안녕하세요!", "timestamp": 1001.0},
+        {"role": "user", "content": "어제 수면 어땠어?", "timestamp": 1002.0}
+    ]

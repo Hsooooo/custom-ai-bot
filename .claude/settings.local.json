@@ -10,7 +10,27 @@
       "Bash(chmod:*)",
       "Bash(npm install:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(omc)",
+      "Bash(~/.npm-global/bin/omc)",
+      "Bash(npx oh-my-claude-sisyphus)",
+      "Bash(python3:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python -m pytest tests/test_memory.py -v)",
+      "Bash(pip install:*)",
+      "Bash(find:*)",
+      "Bash(tree:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(/usr/local/bin/python -m pip install:*)",
+      "Bash(/usr/local/bin/python -m pytest tests/test_skill_parser.py::TestSkillParser::test_parse_valid_skill -v)",
+      "Bash(/usr/local/bin/python -m pytest tests/test_skill_parser.py -v)",
+      "Bash(/usr/local/bin/python -m pytest tests/test_tool_registry.py -v)",
+      "Bash(/usr/local/bin/python -m pytest tests/test_agent_integration.py -v)",
+      "Bash(/usr/local/bin/python -m pytest tests/test_skill_parser.py tests/test_tool_registry.py tests/test_agent_integration.py -v --tb=short)",
+      "Bash(/usr/local/bin/python -m pytest:*)",
+      "Bash(git checkout:*)",
+      "Bash(wc:*)"
     ]
   }
 }
