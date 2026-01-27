@@ -1,0 +1,10 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY workers/worker-coach/requirements.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY workers/worker-coach/main.py main.py
+
+CMD ["python", "-u", "main.py"]
