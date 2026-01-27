@@ -392,7 +392,14 @@ def main():
     schedule.every().sunday.at("23:00").do(run_draft_job)
     logger.info("Scheduled: weekly draft Sunday 23:00")
 
-    # optional: do nothing else
+    # Optional: manual one-shot for testing (won't run unless explicitly enabled)
+    if os.getenv("COACH_RUN_DRAFT_ON_START") == "1":
+        logger.warning("COACH_RUN_DRAFT_ON_START=1 -> running draft job once")
+        try:
+            run_draft_job()
+        except Exception as e:
+            logger.error(f"Draft job failed on start: {e}")
+
     while True:
         schedule.run_pending()
         time.sleep(30)
