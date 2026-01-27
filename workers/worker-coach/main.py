@@ -24,6 +24,7 @@ import schedule
 import pytz
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
+import decimal
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -237,6 +238,22 @@ def fmt_hms(seconds: Optional[int]) -> str:
     return f"{h}:{m:02d}:{sec:02d}"
 
 
+def _json_sanitize(obj: Any) -> Any:
+    """Make objects JSON-serializable (dates/timestamps -> isoformat)."""
+    if obj is None:
+        return None
+    if isinstance(obj, (dt.date, dt.datetime)):
+        return obj.isoformat()
+    if isinstance(obj, decimal.Decimal):
+        # NUMERIC from Postgres
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_sanitize(v) for v in obj]
+    return obj
+
+
 def draft_template(week_start: dt.date, race: Optional[Dict[str, Any]], injuries: List[Dict[str, Any]], summary14: Dict[str, Any], last_runs: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     lines: List[str] = []
     lines.append("🧑‍🏫 Weekly Coach Plan (DRAFT)")
@@ -294,10 +311,10 @@ def draft_template(week_start: dt.date, race: Optional[Dict[str, Any]], injuries
 
     data = {
         "week_start": str(week_start),
-        "race": race,
-        "injuries": injuries,
-        "summary14": summary14,
-        "last_runs": last_runs,
+        "race": _json_sanitize(race),
+        "injuries": _json_sanitize(injuries),
+        "summary14": _json_sanitize(summary14),
+        "last_runs": _json_sanitize(last_runs),
         "prompt_version": "mvp-template-v1",
     }
 
