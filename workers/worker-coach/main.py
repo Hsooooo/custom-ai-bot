@@ -589,6 +589,164 @@ def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[Dict[s
     return {"draft_id": draft_id, "turn": turn + 1, "text": text}
 
 
+def _parse_weekly_plan_days(text: str) -> List[Dict[str, Any]]:
+    """Best-effort parse for lines like:
+
+    - 2026-02-03 (화): 이지 러닝 (6km, 40분) - RPE 4-5
+
+    Returns list of {plan_date, session_type, duration_min, distance_km, intensity, notes}.
+    """
+    import re
+
+    days: List[Dict[str, Any]] = []
+    if not text:
+        return days
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("-"):
+            continue
+
+        m = re.match(r"^-\s*(\d{4}-\d{2}-\d{2})\s*\([^)]*\)\s*:\s*(.*)$", line)
+        if not m:
+            continue
+
+        date_s = m.group(1)
+        rest = m.group(2).strip()
+
+        session_type = None
+        duration_min = None
+        distance_km = None
+        intensity = None
+
+        # session type: before first '(' or before ' - '
+        head = rest
+        if "(" in head:
+            head = head.split("(", 1)[0].strip()
+        if " - " in head:
+            head = head.split(" - ", 1)[0].strip()
+        session_type = head[:80] if head else None
+
+        # parentheses may contain "6km, 40분" etc.
+        pm = re.search(r"\(([^)]*)\)", rest)
+        if pm:
+            inside = pm.group(1)
+            km_m = re.search(r"(\d+(?:\.\d+)?)\s*km", inside, re.IGNORECASE)
+            if km_m:
+                try:
+                    distance_km = float(km_m.group(1))
+                except Exception:
+                    pass
+            min_m = re.search(r"(\d+)\s*분", inside)
+            if min_m:
+                try:
+                    duration_min = int(min_m.group(1))
+                except Exception:
+                    pass
+
+        # intensity hint after '-' segment
+        if " - " in rest:
+            intensity = rest.split(" - ", 1)[1].strip()[:120]
+
+        days.append(
+            {
+                "plan_date": date_s,
+                "session_type": session_type,
+                "duration_min": duration_min,
+                "distance_km": distance_km,
+                "intensity": intensity,
+                "notes": rest,
+            }
+        )
+
+    return days
+
+
+def confirm_weekly_plan() -> Dict[str, Any]:
+    """Confirm the latest draft for next week into training_plan_weekly/day."""
+    wk = next_week_start(tz_now().date())
+    d = get_latest_draft(wk)
+    if not d or not d.get("draft_text"):
+        raise RuntimeError("No active draft to confirm")
+
+    draft_text = d["draft_text"]
+    draft_data = d.get("draft_data") or {}
+
+    # derive plan days
+    day_rows = _parse_weekly_plan_days(draft_text)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # upsert weekly
+    cur.execute(
+        """
+        INSERT INTO training_plan_weekly (week_start, race_event_id, raw_plan_text, prompt_version, model)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (week_start) DO UPDATE SET
+          race_event_id=EXCLUDED.race_event_id,
+          raw_plan_text=EXCLUDED.raw_plan_text,
+          prompt_version=EXCLUDED.prompt_version,
+          model=EXCLUDED.model,
+          created_at=NOW();
+        """,
+        (
+            wk,
+            (draft_data.get("race") or {}).get("id") if isinstance(draft_data.get("race"), dict) else None,
+            draft_text,
+            str(draft_data.get("prompt_version") or "weekly_plan_v1"),
+            OPENAI_MODEL,
+        ),
+    )
+
+    # clear existing day rows for that week
+    cur.execute(
+        "DELETE FROM training_plan_day WHERE plan_date >= %s AND plan_date <= %s",
+        (wk, wk + dt.timedelta(days=6)),
+    )
+
+    for day in day_rows:
+        cur.execute(
+            """
+            INSERT INTO training_plan_day (week_start, plan_date, session_type, duration_min, distance_km, intensity, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (plan_date) DO UPDATE SET
+              week_start=EXCLUDED.week_start,
+              session_type=EXCLUDED.session_type,
+              duration_min=EXCLUDED.duration_min,
+              distance_km=EXCLUDED.distance_km,
+              intensity=EXCLUDED.intensity,
+              notes=EXCLUDED.notes;
+            """,
+            (
+                wk,
+                day["plan_date"],
+                day.get("session_type"),
+                day.get("duration_min"),
+                day.get("distance_km"),
+                day.get("intensity"),
+                day.get("notes"),
+            ),
+        )
+
+    # mark session confirmed
+    cur.execute(
+        "UPDATE coach_session SET status='confirmed', updated_at=NOW() WHERE week_start=%s",
+        (wk,),
+    )
+    # mark draft confirmed
+    cur.execute(
+        "UPDATE training_plan_draft_weekly SET status='confirmed' WHERE id=%s",
+        (int(d.get("id")),),
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"week_start": str(wk), "draft_id": int(d.get("id")), "days": len(day_rows)}
+
+
 def run_review_poll():
     """Find newest running activities and send review once per activity."""
     logger.info("Review poll tick")
@@ -641,7 +799,8 @@ def _telegram_bot_loop():
         return
 
     from telegram import Update
-    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
     admin_id = int(TELEGRAM_ADMIN_ID)
 
@@ -657,11 +816,18 @@ def _telegram_bot_loop():
             return
         await update.message.reply_text("🧑‍🏫 코치봇 준비 완료. /weekly_coach_plan 로 초안을 생성/확인할 수 있어요.")
 
+    def _draft_keyboard():
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("✅ 확정", callback_data="confirm_weekly")],
+                [InlineKeyboardButton("🔄 수정(피드백 보내기)", callback_data="noop"), InlineKeyboardButton("❌ 취소", callback_data="cancel_weekly")],
+            ]
+        )
+
     async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_admin(update):
             return
 
-        # create if missing
         run_draft_job(force=False)
 
         wk = next_week_start(tz_now().date())
@@ -670,7 +836,10 @@ def _telegram_bot_loop():
             txt = d["draft_text"]
             if len(txt) > 3800:
                 txt = txt[:3800] + "\n…(truncated)"
-            await update.message.reply_text(txt + f"\n\n(draft_id={d.get('id')}, version={d.get('version')})")
+            await update.message.reply_text(
+                txt + f"\n\n(draft_id={d.get('id')}, version={d.get('version')})\n확정하려면 /confirm_weekly_plan",
+                reply_markup=_draft_keyboard(),
+            )
         else:
             await update.message.reply_text("초안이 아직 없어요. 잠시 후 다시 시도해줘.")
 
@@ -687,21 +856,63 @@ def _telegram_bot_loop():
         try:
             res = regenerate_weekly_draft_from_feedback(txt)
             if res is None:
-                await update.message.reply_text("이번 주 주간 플랜 수정 왕복 한도(3회)에 도달했어. (최대 3회)\n필요하면 '초안 재생성'이라고 말해줘(리셋 기능은 다음 단계에서 정식으로 붙일게).")
+                await update.message.reply_text(
+                    "이번 주 주간 플랜 수정 왕복 한도(3회)에 도달했어. (최대 3회)\n이제 확정하려면 /confirm_weekly_plan"
+                )
                 return
 
-            # Send updated draft directly in this chat
             text = res.get("text", "")
             if len(text) > 3800:
                 text = text[:3800] + "\n…(truncated)"
-            await update.message.reply_text(text + f"\n\n(draft_id={res.get('draft_id')}, turn={res.get('turn')}/3)")
+            await update.message.reply_text(
+                text + f"\n\n(draft_id={res.get('draft_id')}, turn={res.get('turn')}/3)\n확정하려면 /confirm_weekly_plan",
+                reply_markup=_draft_keyboard(),
+            )
         except Exception as e:
             logger.error(f"weekly feedback failed: {e}")
             await update.message.reply_text("초안 업데이트 중 오류가 났어. 잠시 후 다시 시도해줘.")
 
+    async def cmd_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await check_admin(update):
+            return
+        try:
+            res = confirm_weekly_plan()
+            await update.message.reply_text(
+                f"✅ 확정 완료! week_start={res['week_start']} (draft_id={res['draft_id']})\n일별 저장: {res['days']}개"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ 확정 실패: {e}")
+
+    async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.callback_query:
+            return
+        q = update.callback_query
+        await q.answer()
+        # Only admin
+        if not update.effective_user or update.effective_user.id != int(TELEGRAM_ADMIN_ID):
+            await q.edit_message_text("⛔ 접근 권한이 없습니다.")
+            return
+        if q.data == "confirm_weekly":
+            try:
+                res = confirm_weekly_plan()
+                await q.edit_message_text(
+                    f"✅ 확정 완료! week_start={res['week_start']} (draft_id={res['draft_id']})\n일별 저장: {res['days']}개"
+                )
+            except Exception as e:
+                await q.edit_message_text(f"❌ 확정 실패: {e}")
+        elif q.data == "cancel_weekly":
+            wk = next_week_start(tz_now().date())
+            _expire_existing_drafts(wk, new_status="cancelled")
+            await q.edit_message_text("취소했어. 필요하면 /weekly_coach_plan 로 다시 초안 생성 가능")
+        else:
+            # noop
+            return
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("weekly_coach_plan", cmd_weekly))
+    app.add_handler(CommandHandler("confirm_weekly_plan", cmd_confirm))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     logger.info("Coach bot polling started")
