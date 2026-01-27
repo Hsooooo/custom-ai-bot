@@ -133,6 +133,26 @@ services:
     networks:
       - clawd_net
 
+  worker-coach:
+    build:
+      context: .
+      dockerfile: workers/worker-coach/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - TZ=${TZ}
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
+      - COACH_TELEGRAM_BOT_TOKEN=${COACH_TELEGRAM_BOT_TOKEN}
+      # Future: LLM calls
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - clawd_net
+
 volumes:
   postgres_data:
   redis_data:
