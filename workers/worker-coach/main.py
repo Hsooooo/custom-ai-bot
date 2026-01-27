@@ -531,8 +531,12 @@ def _build_review_input(activity_id: int) -> Dict[str, Any]:
     }
 
 
-def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
-    """Consume user feedback (1 turn) and regenerate the active weekly draft."""
+def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[Dict[str, Any]]:
+    """Consume user feedback (1 turn) and regenerate the active weekly draft.
+
+    Returns a dict with {draft_id, turn, text} on success.
+    NOTE: do not call asyncio.run() here; this can be invoked from an async handler.
+    """
     local_now = tz_now()
     wk = next_week_start(local_now.date())
 
@@ -543,8 +547,8 @@ def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
         return None
 
     latest = get_latest_draft(wk)
-    # If no draft exists yet, create one first
     if not latest:
+        # create one first
         run_draft_job(force=False)
         latest = get_latest_draft(wk)
         if not latest:
@@ -559,7 +563,7 @@ def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
     last_runs = get_last_runs(2)
 
     # include feedback as high-priority constraints
-    text, data = draft_template(wk, race, injuries, summary14, last_runs)
+    base_text, data = draft_template(wk, race, injuries, summary14, last_runs)
     data["user_feedback"] = (feedback_text or "").strip()
     data["turn_index"] = turn + 1
 
@@ -567,6 +571,8 @@ def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
     tmpl = _read_prompt("/app/prompts/weekly_plan.md")
     user = _render_prompt(tmpl, data)
     text = _openai_generate(system=persona, user=user)
+    if not text:
+        text = base_text
 
     # increment turn
     conn = get_db_connection()
@@ -580,11 +586,7 @@ def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
     conn.close()
 
     draft_id = save_draft(wk, text, data, turn_count=turn + 1)
-
-    import asyncio
-
-    asyncio.run(send_telegram(text + f"\n\n(draft_id={draft_id}, turn={turn+1}/3)"))
-    return draft_id
+    return {"draft_id": draft_id, "turn": turn + 1, "text": text}
 
 
 def run_review_poll():
@@ -658,13 +660,17 @@ def _telegram_bot_loop():
     async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await check_admin(update):
             return
+
         # create if missing
         run_draft_job(force=False)
-        # send latest draft again (if exists)
+
         wk = next_week_start(tz_now().date())
         d = get_latest_draft(wk)
         if d and d.get("draft_text"):
-            await update.message.reply_text(d["draft_text"] + f"\n\n(draft_id={d.get('id')}, version={d.get('version')})")
+            txt = d["draft_text"]
+            if len(txt) > 3800:
+                txt = txt[:3800] + "\n…(truncated)"
+            await update.message.reply_text(txt + f"\n\n(draft_id={d.get('id')}, version={d.get('version')})")
         else:
             await update.message.reply_text("초안이 아직 없어요. 잠시 후 다시 시도해줘.")
 
@@ -675,16 +681,23 @@ def _telegram_bot_loop():
             return
 
         txt = update.message.text.strip()
-        # ignore commands
         if txt.startswith("/"):
             return
 
-        # treat as feedback for weekly plan
-        draft_id = regenerate_weekly_draft_from_feedback(txt)
-        if draft_id is None:
-            await update.message.reply_text("이번 주 주간 플랜 수정 왕복 한도(3회)에 도달했어. 확정/취소 플로우는 다음 단계에서 붙일게.")
-        else:
-            await update.message.reply_text("피드백 반영해서 초안을 업데이트했어. (코치 메시지 확인)")
+        try:
+            res = regenerate_weekly_draft_from_feedback(txt)
+            if res is None:
+                await update.message.reply_text("이번 주 주간 플랜 수정 왕복 한도(3회)에 도달했어. (최대 3회)\n필요하면 '초안 재생성'이라고 말해줘(리셋 기능은 다음 단계에서 정식으로 붙일게).")
+                return
+
+            # Send updated draft directly in this chat
+            text = res.get("text", "")
+            if len(text) > 3800:
+                text = text[:3800] + "\n…(truncated)"
+            await update.message.reply_text(text + f"\n\n(draft_id={res.get('draft_id')}, turn={res.get('turn')}/3)")
+        except Exception as e:
+            logger.error(f"weekly feedback failed: {e}")
+            await update.message.reply_text("초안 업데이트 중 오류가 났어. 잠시 후 다시 시도해줘.")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
