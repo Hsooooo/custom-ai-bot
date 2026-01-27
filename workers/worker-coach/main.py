@@ -25,6 +25,7 @@ import pytz
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 import decimal
+import threading
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
@@ -164,12 +165,21 @@ def has_confirmed_plan(week_start: dt.date) -> bool:
     return row is not None
 
 
-def has_draft(week_start: dt.date) -> bool:
-    row = select_one(
-        "SELECT id FROM training_plan_draft_weekly WHERE week_start=%s AND status='draft' ORDER BY version DESC LIMIT 1",
+def get_latest_draft(week_start: dt.date) -> Optional[Dict[str, Any]]:
+    return select_one(
+        """
+        SELECT id, week_start, version, status, draft_text, draft_data, created_at
+        FROM training_plan_draft_weekly
+        WHERE week_start=%s AND status='draft'
+        ORDER BY version DESC
+        LIMIT 1
+        """,
         (week_start,),
     )
-    return row is not None
+
+
+def has_draft(week_start: dt.date) -> bool:
+    return get_latest_draft(week_start) is not None
 
 
 def get_next_race() -> Optional[Dict[str, Any]]:
@@ -342,9 +352,10 @@ def draft_template(week_start: dt.date, race: Optional[Dict[str, Any]], injuries
     return text, data
 
 
-def save_draft(week_start: dt.date, text: str, data: Dict[str, Any]) -> int:
+def save_draft(week_start: dt.date, text: str, data: Dict[str, Any], *, turn_count: int = 0, last_user_feedback: Optional[str] = None) -> int:
     conn = get_db_connection()
     cur = conn.cursor()
+
     # next version
     cur.execute(
         "SELECT COALESCE(MAX(version),0)+1 FROM training_plan_draft_weekly WHERE week_start=%s",
@@ -365,13 +376,14 @@ def save_draft(week_start: dt.date, text: str, data: Dict[str, Any]) -> int:
     cur.execute(
         """
         INSERT INTO coach_session (week_start, turn_count, status, last_message, updated_at)
-        VALUES (%s, 0, 'draft', %s, NOW())
+        VALUES (%s, %s, 'draft', %s, NOW())
         ON CONFLICT (week_start) DO UPDATE SET
+          turn_count=EXCLUDED.turn_count,
           status='draft',
           last_message=EXCLUDED.last_message,
           updated_at=NOW();
         """,
-        (week_start, text[:4000]),
+        (week_start, int(turn_count), (text[:3500] if text else "")),
     )
 
     conn.commit()
@@ -394,7 +406,36 @@ async def send_telegram(message: str):
     await bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=message)
 
 
-def run_draft_job():
+def _expire_existing_drafts(week_start: dt.date, *, new_status: str = "superseded"):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE training_plan_draft_weekly SET status=%s WHERE week_start=%s AND status='draft'",
+        (new_status, week_start),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _get_or_init_session(week_start: dt.date) -> Dict[str, Any]:
+    row = select_one("SELECT week_start, turn_count, status FROM coach_session WHERE week_start=%s", (week_start,))
+    if row:
+        return row
+    # create placeholder
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO coach_session (week_start, turn_count, status, last_message, updated_at) VALUES (%s,0,'draft','',NOW()) ON CONFLICT (week_start) DO NOTHING",
+        (week_start,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"week_start": week_start, "turn_count": 0, "status": "draft"}
+
+
+def run_draft_job(*, force: bool = False):
     local_now = tz_now()
     today = local_now.date()
     wk = next_week_start(today)
@@ -404,9 +445,15 @@ def run_draft_job():
     if has_confirmed_plan(wk):
         logger.info("Skip: confirmed plan already exists")
         return
-    if has_draft(wk):
+    if (not force) and has_draft(wk):
         logger.info("Skip: draft already exists")
         return
+
+    # expire previous active drafts if forcing regeneration
+    if force:
+        _expire_existing_drafts(wk, new_status="expired")
+
+    session = _get_or_init_session(wk)
 
     race = get_next_race()
     injuries = get_recent_injuries(5)
@@ -414,7 +461,7 @@ def run_draft_job():
     last_runs = get_last_runs(2)
 
     text, data = draft_template(wk, race, injuries, summary14, last_runs)
-    draft_id = save_draft(wk, text, data)
+    draft_id = save_draft(wk, text, data, turn_count=int(session.get("turn_count") or 0))
 
     import asyncio
 
@@ -484,6 +531,62 @@ def _build_review_input(activity_id: int) -> Dict[str, Any]:
     }
 
 
+def regenerate_weekly_draft_from_feedback(feedback_text: str) -> Optional[int]:
+    """Consume user feedback (1 turn) and regenerate the active weekly draft."""
+    local_now = tz_now()
+    wk = next_week_start(local_now.date())
+
+    session = _get_or_init_session(wk)
+    turn = int(session.get("turn_count") or 0)
+    if turn >= 3:
+        logger.info("Weekly draft turn limit reached (3)")
+        return None
+
+    latest = get_latest_draft(wk)
+    # If no draft exists yet, create one first
+    if not latest:
+        run_draft_job(force=False)
+        latest = get_latest_draft(wk)
+        if not latest:
+            return None
+
+    # expire current draft
+    _expire_existing_drafts(wk, new_status="superseded")
+
+    race = get_next_race()
+    injuries = get_recent_injuries(5)
+    summary14 = get_running_summary_14d()
+    last_runs = get_last_runs(2)
+
+    # include feedback as high-priority constraints
+    text, data = draft_template(wk, race, injuries, summary14, last_runs)
+    data["user_feedback"] = (feedback_text or "").strip()
+    data["turn_index"] = turn + 1
+
+    persona = _read_prompt("/app/prompts/persona.md")
+    tmpl = _read_prompt("/app/prompts/weekly_plan.md")
+    user = _render_prompt(tmpl, data)
+    text = _openai_generate(system=persona, user=user)
+
+    # increment turn
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE coach_session SET turn_count=turn_count+1, updated_at=NOW() WHERE week_start=%s",
+        (wk,),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    draft_id = save_draft(wk, text, data, turn_count=turn + 1)
+
+    import asyncio
+
+    asyncio.run(send_telegram(text + f"\n\n(draft_id={draft_id}, turn={turn+1}/3)"))
+    return draft_id
+
+
 def run_review_poll():
     """Find newest running activities and send review once per activity."""
     logger.info("Review poll tick")
@@ -523,16 +626,84 @@ def run_review_poll():
             break
 
 
+def _schedule_loop():
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+def _telegram_bot_loop():
+    """Run coach bot polling to accept feedback and regenerate drafts."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+        logger.warning("Coach bot polling disabled (missing token/admin id)")
+        return
+
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+
+    admin_id = int(TELEGRAM_ADMIN_ID)
+
+    async def check_admin(update: Update) -> bool:
+        if not update.effective_user or update.effective_user.id != admin_id:
+            if update.message:
+                await update.message.reply_text("⛔ 접근 권한이 없습니다.")
+            return False
+        return True
+
+    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await check_admin(update):
+            return
+        await update.message.reply_text("🧑‍🏫 코치봇 준비 완료. /weekly_coach_plan 로 초안을 생성/확인할 수 있어요.")
+
+    async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await check_admin(update):
+            return
+        # create if missing
+        run_draft_job(force=False)
+        # send latest draft again (if exists)
+        wk = next_week_start(tz_now().date())
+        d = get_latest_draft(wk)
+        if d and d.get("draft_text"):
+            await update.message.reply_text(d["draft_text"] + f"\n\n(draft_id={d.get('id')}, version={d.get('version')})")
+        else:
+            await update.message.reply_text("초안이 아직 없어요. 잠시 후 다시 시도해줘.")
+
+    async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await check_admin(update):
+            return
+        if not update.message or not update.message.text:
+            return
+
+        txt = update.message.text.strip()
+        # ignore commands
+        if txt.startswith("/"):
+            return
+
+        # treat as feedback for weekly plan
+        draft_id = regenerate_weekly_draft_from_feedback(txt)
+        if draft_id is None:
+            await update.message.reply_text("이번 주 주간 플랜 수정 왕복 한도(3회)에 도달했어. 확정/취소 플로우는 다음 단계에서 붙일게.")
+        else:
+            await update.message.reply_text("피드백 반영해서 초안을 업데이트했어. (코치 메시지 확인)")
+
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("weekly_coach_plan", cmd_weekly))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    logger.info("Coach bot polling started")
+    app.run_polling()
+
+
 def main():
     logger.info("worker-coach started")
     time.sleep(10)
     init_db()
 
-    # schedule: Sunday 23:00 weekly draft
+    # schedules
     schedule.every().sunday.at("23:00").do(run_draft_job)
     logger.info("Scheduled: weekly draft Sunday 23:00")
 
-    # schedule: workout review poll every 5 minutes
     schedule.every(5).minutes.do(run_review_poll)
     logger.info("Scheduled: workout review poll every 5 minutes")
 
@@ -540,7 +711,7 @@ def main():
     if os.getenv("COACH_RUN_DRAFT_ON_START") == "1":
         logger.warning("COACH_RUN_DRAFT_ON_START=1 -> running draft job once")
         try:
-            run_draft_job()
+            run_draft_job(force=True)
         except Exception as e:
             logger.error(f"Draft job failed on start: {e}")
 
@@ -551,9 +722,12 @@ def main():
         except Exception as e:
             logger.error(f"Review poll failed on start: {e}")
 
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
+    # run schedule loop in background
+    t = threading.Thread(target=_schedule_loop, daemon=True)
+    t.start()
+
+    # run telegram polling in main thread
+    _telegram_bot_loop()
 
 
 if __name__ == "__main__":
