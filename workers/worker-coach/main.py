@@ -10,8 +10,8 @@ Goal (MVP):
   - next race event
 
 Notes:
-- This MVP intentionally avoids LLM calls.
-- Later: add LLM prompt + 3-turn guided Q&A + confirm->insert final plan.
+- LLM calls are used for weekly draft + workout review messages.
+- Later: add 3-turn guided Q&A + confirm->insert final plan.
 """
 
 import os
@@ -38,6 +38,9 @@ POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "clawd_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "clawd_user")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def get_db_connection():
@@ -99,6 +102,16 @@ def init_db():
           last_message TEXT,
           updated_at TIMESTAMP DEFAULT NOW(),
           UNIQUE (week_start)
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS workout_review_log (
+          activity_id BIGINT PRIMARY KEY,
+          sent_at TIMESTAMP,
+          status TEXT NOT NULL DEFAULT 'pending',
+          model TEXT,
+          prompt_version TEXT,
+          error TEXT
         );
         """,
     ]
@@ -239,13 +252,12 @@ def fmt_hms(seconds: Optional[int]) -> str:
 
 
 def _json_sanitize(obj: Any) -> Any:
-    """Make objects JSON-serializable (dates/timestamps -> isoformat)."""
+    """Make objects JSON-serializable (dates/timestamps/decimals)."""
     if obj is None:
         return None
     if isinstance(obj, (dt.date, dt.datetime)):
         return obj.isoformat()
     if isinstance(obj, decimal.Decimal):
-        # NUMERIC from Postgres
         return float(obj)
     if isinstance(obj, dict):
         return {k: _json_sanitize(v) for k, v in obj.items()}
@@ -254,71 +266,80 @@ def _json_sanitize(obj: Any) -> Any:
     return obj
 
 
+def _read_prompt(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _render_prompt(template: str, data: Dict[str, Any]) -> str:
+    import json
+
+    return template.replace("{{DATA_JSON}}", json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def _openai_generate(system: str, user: str) -> str:
+    """Call OpenAI Chat Completions API with basic retry/backoff."""
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured")
+
+    import httpx
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.4,
+    }
+
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+
+            # retry on rate limits
+            if resp.status_code == 429:
+                wait_s = 2 * (2**attempt)
+                logger.warning(f"OpenAI rate limited (429). Retrying in {wait_s}s...")
+                time.sleep(wait_s)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+            return (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        except Exception as e:
+            last_err = e
+            wait_s = 2 * (2**attempt)
+            logger.warning(f"OpenAI call failed (attempt {attempt+1}/3): {e}. Retrying in {wait_s}s")
+            time.sleep(wait_s)
+
+    raise RuntimeError(f"OpenAI call failed after retries: {last_err}")
+
+
 def draft_template(week_start: dt.date, race: Optional[Dict[str, Any]], injuries: List[Dict[str, Any]], summary14: Dict[str, Any], last_runs: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
-    lines: List[str] = []
-    lines.append("🧑‍🏫 Weekly Coach Plan (DRAFT)")
-    lines.append(f"Week start: {week_start} (Mon)")
-
-    if race:
-        tgt = fmt_hms(race.get("target_time_sec"))
-        lines.append("")
-        lines.append("🏁 Next race")
-        lines.append(f"- {race.get('race_date')} {race.get('name')} {race.get('distance_km')}km @ {race.get('location','')}")
-        lines.append(f"- Target time: {tgt}")
-
-    if injuries:
-        lines.append("")
-        lines.append("🩹 Recent injuries (latest 5)")
-        for inj in injuries:
-            lines.append(
-                f"- {inj.get('date')} {inj.get('side','')}/{inj.get('body_part')} pain {inj.get('pain_score')}/10 ({inj.get('pain_type','')}) trigger={inj.get('trigger','')}"
-            )
-
-    lines.append("")
-    lines.append("📈 Running summary (last 14d)")
-    total_km = float(summary14.get("total_m", 0) or 0) / 1000.0
-    total_h = int(summary14.get("total_sec", 0) or 0) // 3600
-    lines.append(f"- runs: {summary14.get('run_count',0)} | distance: {total_km:.1f}km | time: {total_h}h")
-
-    if last_runs:
-        lines.append("")
-        lines.append("🏃 Last 2 runs (detail)")
-        for r in last_runs:
-            dist_km = float(r.get("distance_meters") or 0) / 1000.0
-            dur = fmt_hms(r.get("duration_sec"))
-            lines.append(
-                f"- {r.get('start_time')} {r.get('activity_name','running')} {dist_km:.2f}km / {dur} | HR avg {r.get('avg_hr')} max {r.get('max_hr')} | pace {r.get('avg_pace') or ''}"
-            )
-            laps = r.get("laps") or []
-            if laps:
-                # show first 6 laps to keep message small
-                for lap in laps[:6]:
-                    lines.append(
-                        f"  lap{lap.get('lap_index')}: {lap.get('avg_pace','')} HR {lap.get('avg_hr','')}/{lap.get('max_hr','')} dur {int(float(lap.get('duration_sec') or 0))}s"
-                    )
-                if len(laps) > 6:
-                    lines.append(f"  … ({len(laps)} laps total)")
-
-    lines.append("")
-    lines.append("❓ Quick questions (reply as 1)…, 2)…)")
-    lines.append("1) Any days/times you CANNOT run next week?")
-    lines.append("2) Current pain status (0-10 + body part)?")
-    lines.append("3) Preferred number of runs next week (3/4/5/6)?")
-    lines.append("4) Long run day preference (Sat/Sun/none)?")
-
-    lines.append("")
-    lines.append("Reply with your answers. We'll iterate up to 3 times and then confirm.")
-
     data = {
         "week_start": str(week_start),
         "race": _json_sanitize(race),
         "injuries": _json_sanitize(injuries),
         "summary14": _json_sanitize(summary14),
         "last_runs": _json_sanitize(last_runs),
-        "prompt_version": "mvp-template-v1",
+        "prompt_version": "weekly_plan_v1",
     }
 
-    return "\n".join(lines), data
+    persona = _read_prompt("/app/prompts/persona.md")
+    tmpl = _read_prompt("/app/prompts/weekly_plan.md")
+    user = _render_prompt(tmpl, data)
+
+    text = _openai_generate(system=persona, user=user)
+    if not text:
+        # fallback (should be rare)
+        text = "주간 플랜 초안 생성 실패(LLM 응답 없음)."
+
+    return text, data
 
 
 def save_draft(week_start: dt.date, text: str, data: Dict[str, Any]) -> int:
@@ -367,6 +388,9 @@ async def send_telegram(message: str):
     from telegram import Bot
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    # Telegram message length limit safety
+    if len(message) > 3800:
+        message = message[:3800] + "\n…(truncated)"
     await bot.send_message(chat_id=TELEGRAM_ADMIN_ID, text=message)
 
 
@@ -375,7 +399,6 @@ def run_draft_job():
     today = local_now.date()
     wk = next_week_start(today)
 
-    # only run on Sunday 23:00 schedule, but guard anyway
     logger.info(f"Draft job tick: now={local_now.isoformat()} next_week_start={wk}")
 
     if has_confirmed_plan(wk):
@@ -393,11 +416,111 @@ def run_draft_job():
     text, data = draft_template(wk, race, injuries, summary14, last_runs)
     draft_id = save_draft(wk, text, data)
 
-    # send
     import asyncio
 
     asyncio.run(send_telegram(text + f"\n\n(draft_id={draft_id})"))
     logger.info(f"Draft sent. draft_id={draft_id}")
+
+
+def _mark_review_sent(activity_id: int, *, status: str, error: Optional[str] = None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO workout_review_log (activity_id, sent_at, status, model, prompt_version, error)
+        VALUES (%s, NOW(), %s, %s, %s, %s)
+        ON CONFLICT (activity_id) DO UPDATE SET
+          sent_at=EXCLUDED.sent_at,
+          status=EXCLUDED.status,
+          model=EXCLUDED.model,
+          prompt_version=EXCLUDED.prompt_version,
+          error=EXCLUDED.error;
+        """,
+        (activity_id, status, OPENAI_MODEL, "workout_review_v1", error),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _already_reviewed(activity_id: int) -> bool:
+    row = select_one("SELECT activity_id, status FROM workout_review_log WHERE activity_id=%s", (activity_id,))
+    if not row:
+        return False
+    # If previously failed, allow retry later (next poll)
+    return row.get("status") == "sent"
+
+
+def _build_review_input(activity_id: int) -> Dict[str, Any]:
+    act = select_one(
+        """
+        SELECT activity_id, activity_name, start_time, duration_sec, distance_meters,
+               avg_hr, max_hr, avg_pace
+        FROM exercise_activity
+        WHERE activity_id=%s
+        """,
+        (activity_id,),
+    )
+
+    laps = select_all(
+        """
+        SELECT lap_index, distance_meters, duration_sec, avg_pace, avg_hr, max_hr
+        FROM exercise_lap
+        WHERE activity_id=%s
+        ORDER BY lap_index
+        """,
+        (activity_id,),
+    )
+
+    injuries = get_recent_injuries(5)
+    race = get_next_race()
+
+    return {
+        "activity": _json_sanitize(act),
+        "laps": _json_sanitize(laps),
+        "injuries": _json_sanitize(injuries),
+        "next_race": _json_sanitize(race),
+        "tz": TZ,
+    }
+
+
+def run_review_poll():
+    """Find newest running activities and send review once per activity."""
+    logger.info("Review poll tick")
+    latest = select_all(
+        """
+        SELECT activity_id
+        FROM exercise_activity
+        WHERE activity_type='running'
+        ORDER BY start_time DESC NULLS LAST
+        LIMIT 5
+        """
+    )
+    for row in latest:
+        aid = int(row["activity_id"])
+        if _already_reviewed(aid):
+            continue
+
+        try:
+            data = _build_review_input(aid)
+            persona = _read_prompt("/app/prompts/persona.md")
+            tmpl = _read_prompt("/app/prompts/workout_review.md")
+            user = _render_prompt(tmpl, data)
+            text = _openai_generate(system=persona, user=user)
+            if not text:
+                raise RuntimeError("empty LLM response")
+
+            import asyncio
+
+            asyncio.run(send_telegram(text))
+            _mark_review_sent(aid, status="sent")
+            logger.info(f"Workout review sent for activity_id={aid}")
+            # only send 1 per poll to avoid spam bursts
+            break
+        except Exception as e:
+            logger.error(f"Workout review failed for activity_id={aid}: {e}")
+            _mark_review_sent(aid, status="failed", error=str(e)[:500])
+            break
 
 
 def main():
@@ -405,17 +528,28 @@ def main():
     time.sleep(10)
     init_db()
 
-    # schedule: Sunday 23:00
+    # schedule: Sunday 23:00 weekly draft
     schedule.every().sunday.at("23:00").do(run_draft_job)
     logger.info("Scheduled: weekly draft Sunday 23:00")
 
-    # Optional: manual one-shot for testing (won't run unless explicitly enabled)
+    # schedule: workout review poll every 5 minutes
+    schedule.every(5).minutes.do(run_review_poll)
+    logger.info("Scheduled: workout review poll every 5 minutes")
+
+    # Optional manual one-shots
     if os.getenv("COACH_RUN_DRAFT_ON_START") == "1":
         logger.warning("COACH_RUN_DRAFT_ON_START=1 -> running draft job once")
         try:
             run_draft_job()
         except Exception as e:
             logger.error(f"Draft job failed on start: {e}")
+
+    if os.getenv("COACH_RUN_REVIEW_ON_START") == "1":
+        logger.warning("COACH_RUN_REVIEW_ON_START=1 -> running review poll once")
+        try:
+            run_review_poll()
+        except Exception as e:
+            logger.error(f"Review poll failed on start: {e}")
 
     while True:
         schedule.run_pending()
