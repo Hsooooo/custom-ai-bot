@@ -60,6 +60,8 @@ services:
       - TZ=${TZ}
       - GARMIN_EMAIL=${GARMIN_EMAIL}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      # Sync cadence (minutes). Default in code is 240 (4h). Lower this for faster post-workout ingestion.
+      - GARMIN_SYNC_INTERVAL_MIN=${GARMIN_SYNC_INTERVAL_MIN:-30}
       - POSTGRES_HOST=postgres
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
