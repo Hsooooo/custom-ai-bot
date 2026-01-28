@@ -403,13 +403,94 @@ def sync_activities(client):
         logger.error(f"Failed to sync activities: {e}")
 
 
+def get_recent_health_baseline(target_date: str, days: int = 7):
+    """Compute a simple baseline from the previous N days.
+
+    Returns dict with averages or None if insufficient history.
+    """
+    try:
+        d = datetime.date.fromisoformat(target_date)
+    except Exception:
+        return None
+
+    start = d - datetime.timedelta(days=days)
+    end = d  # exclude target_date
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            AVG(sleep_hours)::float,
+            AVG(resting_hr)::float,
+            AVG(stress_level)::float,
+            AVG(body_battery_min)::float,
+            COUNT(*)
+        FROM health_daily
+        WHERE date >= %s AND date < %s
+          AND sleep_hours IS NOT NULL
+          AND resting_hr IS NOT NULL
+          -- Exclude sentinel zeros that represent missing Garmin data
+          AND sleep_hours > 0
+          AND resting_hr > 0;
+        """,
+        (start, end),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        return None
+
+    avg_sleep, avg_rhr, avg_stress, avg_bb_min, n = row
+    if not n or n < 3:
+        return None
+
+    return {
+        "days": int(n),
+        "avg_sleep_hours": round(avg_sleep, 2) if avg_sleep is not None else None,
+        "avg_resting_hr": round(avg_rhr, 1) if avg_rhr is not None else None,
+        "avg_stress_level": round(avg_stress, 1) if avg_stress is not None else None,
+        "avg_body_battery_min": round(avg_bb_min, 1) if avg_bb_min is not None else None,
+    }
+
+
 def generate_markdown(stats):
     date = stats['date']
     filename = os.path.join(OBSIDIAN_PATH, "Health", f"{date}.md")
-    
+
     # Ensure directory exists
     os.makedirs(os.path.dirname(filename), exist_ok=True)
-    
+
+    baseline = get_recent_health_baseline(date, days=7)
+
+    insight_lines = []
+    if baseline:
+        sleep_delta = None
+        rhr_delta = None
+
+        if stats.get("sleep_hours") is not None and baseline.get("avg_sleep_hours") is not None:
+            sleep_delta = round(float(stats["sleep_hours"]) - float(baseline["avg_sleep_hours"]), 1)
+
+        if stats.get("resting_hr") is not None and baseline.get("avg_resting_hr") is not None:
+            rhr_delta = round(float(stats["resting_hr"]) - float(baseline["avg_resting_hr"]), 1)
+
+        # Simple fatigue flag: lower sleep + higher RHR vs baseline
+        fatigue_flag = False
+        if sleep_delta is not None and rhr_delta is not None:
+            fatigue_flag = (sleep_delta <= -0.5) and (rhr_delta >= 3.0)
+
+        insight_lines.append(f"- **7d Baseline (n={baseline['days']})**: sleep {baseline['avg_sleep_hours']}h, RHR {baseline['avg_resting_hr']} bpm")
+        if sleep_delta is not None:
+            insight_lines.append(f"- **Sleep vs 7d**: {sleep_delta:+.1f}h")
+        if rhr_delta is not None:
+            insight_lines.append(f"- **Resting HR vs 7d**: {rhr_delta:+.1f} bpm")
+        if fatigue_flag:
+            insight_lines.append("- **Fatigue signal**: sleep down + RHR up → 오늘은 강도 낮추고 회복(수면/수분/가벼운 유산소) 추천")
+
+    insights_block = "\n".join(insight_lines) if insight_lines else "- (Not enough history yet)"
+
     content = f"""# Health Summary - {date}
 
 ## Sleep
@@ -425,9 +506,13 @@ def generate_markdown(stats):
 - **Resting HR**: {stats['resting_hr']}
 - **HRV Status**: {stats['hrv_status']}
 
+## Insights (simple)
+{insights_block}
+
 ## Raw Info
 Generated at {datetime.datetime.now().strftime("%H:%M:%S")}
 """
+
     with open(filename, 'w') as f:
         f.write(content)
     logger.info(f"Generated markdown for {date}")
