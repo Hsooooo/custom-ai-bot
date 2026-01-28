@@ -429,7 +429,10 @@ def get_recent_health_baseline(target_date: str, days: int = 7):
         FROM health_daily
         WHERE date >= %s AND date < %s
           AND sleep_hours IS NOT NULL
-          AND resting_hr IS NOT NULL;
+          AND resting_hr IS NOT NULL
+          -- Exclude sentinel zeros that represent missing Garmin data
+          AND sleep_hours > 0
+          AND resting_hr > 0;
         """,
         (start, end),
     )
