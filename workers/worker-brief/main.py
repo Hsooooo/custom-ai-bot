@@ -61,13 +61,23 @@ def get_db_connection():
     )
 
 
-def get_health_data():
-    """Get latest health data from database."""
+def _tz_today() -> datetime.date:
+    tz = pytz.timezone(TZ)
+    return datetime.datetime.now(tz).date()
+
+
+def get_health_data(today: datetime.date | None = None):
+    """Get latest health data from database.
+
+    Note:
+    - Garmin sleep for "last night" is typically stored on *today's* date.
+    - We compute dates in configured TZ (default Asia/Seoul) to avoid UTC drift.
+    """
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Get today and yesterday's data
-    today = datetime.date.today()
+    # Get today and yesterday's data (TZ-aware)
+    today = today or _tz_today()
     yesterday = today - datetime.timedelta(days=1)
 
     cur.execute("""
@@ -212,24 +222,29 @@ async def get_external_data():
 async def generate_briefing_message_async():
     """Generate morning briefing message with external data."""
     try:
-        health = get_health_data()
+        tz = pytz.timezone(TZ)
+        now = datetime.datetime.now(tz)
+        today_date = now.date()
+        yesterday_date = today_date - datetime.timedelta(days=1)
+
+        health = get_health_data(today=today_date)
         activities = get_recent_activities(3)
-        
+
         # Fetch external data
         weather_data, calendar_events, github_activity = await get_external_data()
 
-        today = str(datetime.date.today())
-        yesterday = str(datetime.date.today() - datetime.timedelta(days=1))
+        today = str(today_date)
+        yesterday = str(yesterday_date)
 
-        # Use today's row for sleep (Garmin sync stores last night's sleep on today's date)
-        sleep_data = health.get(today, health.get(yesterday, {}))
+        # Use today's row for sleep if available; if not, fall back to yesterday BUT label it clearly.
+        sleep_data = health.get(today) or health.get(yesterday) or {}
+        sleep_date = today if health.get(today) else (yesterday if health.get(yesterday) else None)
+
         today_data = health.get(today, {})
 
         # Build message
-        tz = pytz.timezone(TZ)
-        now = datetime.datetime.now(tz)
         is_morning = now.hour < 12
-        
+
         if is_morning:
             lines = ["🌅 *Good Morning!*\n"]
         else:
@@ -246,10 +261,14 @@ async def generate_briefing_message_async():
             lines.append("")
 
         # Sleep summary
-        if sleep_data:
+        if sleep_data and sleep_date:
             sleep_hours = sleep_data.get('sleep_hours', 0)
             sleep_score = sleep_data.get('sleep_score', 0)
-            lines.append(f"😴 *수면*: {sleep_hours}시간 (점수: {sleep_score})")
+            label = "오늘 수면" if sleep_date == today else "어제 수면"
+            # Always show the date to avoid confusion.
+            lines.append(f"😴 *{label}* ({sleep_date}): {sleep_hours}시간 (점수: {sleep_score})")
+            if (not is_morning) and sleep_date != today:
+                lines.append("   (참고: 오늘 수면 데이터가 아직 동기화되지 않아 어제 값을 표시했어요)")
         else:
             lines.append("😴 *수면 데이터*: 없음")
 
@@ -384,6 +403,8 @@ def main():
     schedule.every().day.at("07:00").do(run_briefing)
 
     # Also schedule an evening summary at 22:00
+    # Note: Garmin sync may complete slightly after 22:00 depending on runtime; sleep section
+    # will fall back to yesterday with an explicit note if today's row isn't available yet.
     schedule.every().day.at("22:00").do(run_briefing)
 
     logger.info("Scheduled briefings: 07:00, 22:00")
