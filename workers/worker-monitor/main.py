@@ -27,9 +27,18 @@ logging.basicConfig(
 logger = logging.getLogger('worker-monitor')
 
 # Environment Variables
+# Default alert channel: Telegram DM to admin via a dedicated bot token.
+# If ALERT_TELEGRAM_BOT_TOKEN is set, it overrides TELEGRAM_BOT_TOKEN.
+ALERT_TELEGRAM_BOT_TOKEN = os.getenv("ALERT_TELEGRAM_BOT_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_ADMIN_ID = os.getenv("TELEGRAM_ADMIN_ID")
 TZ = os.getenv("TZ", "Asia/Seoul")
+
+# Optional: Postgres for lightweight audit logs (TTL cleanup)
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "clawd_db")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "clawd_user")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
 
 # Monitoring thresholds
 DISK_THRESHOLD_PERCENT = int(os.getenv("DISK_THRESHOLD_PERCENT", "85"))
@@ -52,12 +61,13 @@ def get_docker_client():
 
 async def send_telegram_alert(message: str, parse_mode: str = 'Markdown'):
     """Send alert via Telegram."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+    token = ALERT_TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN
+    if not token or not TELEGRAM_ADMIN_ID:
         logger.warning("Telegram not configured")
         return
-    
+
     try:
-        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        bot = Bot(token=token)
         await bot.send_message(
             chat_id=TELEGRAM_ADMIN_ID,
             text=message,
@@ -259,6 +269,157 @@ def generate_health_report() -> str:
 
 
 # =============================================================================
+# Lightweight Audit Log (Postgres)
+# =============================================================================
+
+
+def get_db_connection():
+    try:
+        import psycopg2
+        return psycopg2.connect(
+            host=POSTGRES_HOST,
+            database=POSTGRES_DB,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+    except Exception as e:
+        logger.warning(f"DB connection unavailable: {e}")
+        return None
+
+
+def init_audit_db():
+    """Create a small table for terminal command logs (TTL 7 days)."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS terminal_command_log (
+          id BIGSERIAL PRIMARY KEY,
+          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          command TEXT NOT NULL,
+          cwd TEXT,
+          exit_code INTEGER,
+          duration_ms INTEGER,
+          raw JSONB
+        );
+        """
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def cleanup_audit_db(days: int = 7):
+    conn = get_db_connection()
+    if not conn:
+        return
+    cur = conn.cursor()
+    cur.execute("DELETE FROM terminal_command_log WHERE ts < NOW() - (%s || ' days')::interval", (str(days),))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# =============================================================================
+# Docker Log Watcher (Garmin/Coach)
+# =============================================================================
+
+LOG_WATCH_CONTAINERS = os.getenv(
+    "LOG_WATCH_CONTAINERS",
+    "custom-ai-bot-worker-garmin-1,custom-ai-bot-worker-coach-1",
+)
+LOG_WATCH_CONTAINERS = [c.strip() for c in LOG_WATCH_CONTAINERS.split(",") if c.strip()]
+LOG_WATCH_TAIL = int(os.getenv("LOG_WATCH_TAIL", "200"))
+LOG_WATCH_POLL_SEC = int(os.getenv("LOG_WATCH_POLL_SEC", "60"))
+LOG_WATCH_COOLDOWN_SEC = int(os.getenv("LOG_WATCH_COOLDOWN_SEC", "600"))
+
+# simple per-container cooldown
+_last_log_alert_at: Dict[str, float] = {}
+_last_seen: Dict[str, int] = {}  # unix seconds
+
+# very simple patterns; tune over time
+SUSPECT_PATTERNS = [
+    "Traceback",
+    "ERROR",
+    "CRITICAL",
+    "FATAL",
+    "Exception",
+    "Failed to sync",
+    "Critical sync error",
+    "Garmin login failed",
+    "Session invalid",
+]
+
+
+def _should_log_alert(key: str) -> bool:
+    now = time.time()
+    last = _last_log_alert_at.get(key, 0)
+    if now - last >= LOG_WATCH_COOLDOWN_SEC:
+        _last_log_alert_at[key] = now
+        return True
+    return False
+
+
+def scan_container_logs_once():
+    client = get_docker_client()
+    if not client:
+        return
+
+    for name in LOG_WATCH_CONTAINERS:
+        try:
+            container = client.containers.get(name)
+        except Exception:
+            continue
+
+        since = _last_seen.get(name)
+        if not since:
+            since = int(time.time()) - 300
+
+        try:
+            out = container.logs(since=since, tail=LOG_WATCH_TAIL)
+            _last_seen[name] = int(time.time())
+        except Exception as e:
+            logger.warning(f"Failed reading logs for {name}: {e}")
+            continue
+
+        text = out.decode("utf-8", errors="ignore") if isinstance(out, (bytes, bytearray)) else str(out)
+        if not text.strip():
+            continue
+
+        hit_lines = []
+        for line in text.splitlines()[-LOG_WATCH_TAIL:]:
+            if any(p in line for p in SUSPECT_PATTERNS):
+                hit_lines.append(line)
+
+        if not hit_lines:
+            continue
+
+        key = f"log:{name}"
+        if not _should_log_alert(key):
+            continue
+
+        # include a small context window: last 15 lines
+        last_lines = text.splitlines()[-15:]
+        msg = "\n".join(last_lines)
+        alert = (
+            f"⚠️ *Log Alert*\n\n"
+            f"*container*: `{name}`\n"
+            f"*matched*: {len(hit_lines)} line(s)\n\n"
+            f"```\n{msg[-3500:]}\n```"
+        )
+        try:
+            asyncio.run(send_telegram_alert(alert, parse_mode="Markdown"))
+        except Exception as e:
+            logger.error(f"Failed sending log alert for {name}: {e}")
+
+
+def sync_log_watch():
+    scan_container_logs_once()
+
+
+# =============================================================================
 # Monitoring Loop
 # =============================================================================
 
@@ -309,10 +470,13 @@ def sync_health_report():
 
 def main():
     logger.info("Worker Monitor started.")
-    
-    # Wait for Docker to be available
+
+    # Wait for dependencies to be available
     time.sleep(10)
-    
+
+    # Init DB table (best-effort)
+    init_audit_db()
+
     # Test Docker connection
     client = get_docker_client()
     if client:
@@ -321,25 +485,36 @@ def main():
         logger.info(f"Found {len(containers)} running containers")
     else:
         logger.error("Failed to connect to Docker")
-    
+
     # Schedule health checks every 5 minutes
     schedule.every(5).minutes.do(sync_health_check)
-    
+
+    # Log watch (garmin/coach)
+    schedule.every(LOG_WATCH_POLL_SEC).seconds.do(sync_log_watch)
+
+    # Audit log cleanup (TTL 7 days)
+    schedule.every().day.at("03:30").do(lambda: cleanup_audit_db(days=7))
+
     # Schedule daily health report at 09:00
     schedule.every().day.at("09:00").do(sync_health_report)
-    
+
     # Schedule weekly detailed report on Monday at 09:00
     schedule.every().monday.at("09:00").do(sync_health_report)
-    
-    logger.info("Scheduled: Health check every 5 min, Daily report at 09:00")
-    
-    # Run initial health check
+
+    logger.info(
+        "Scheduled: health check 5m; log watch {}s; daily report 09:00; audit cleanup 03:30".format(
+            LOG_WATCH_POLL_SEC
+        )
+    )
+
+    # Run initial health check + log watch once
     logger.info("Running initial health check...")
     sync_health_check()
-    
+    sync_log_watch()
+
     while True:
         schedule.run_pending()
-        time.sleep(60)
+        time.sleep(30)
 
 
 if __name__ == "__main__":
