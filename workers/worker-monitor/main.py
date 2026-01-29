@@ -287,39 +287,67 @@ def get_db_connection():
         return None
 
 
-def init_audit_db():
-    """Create a small table for terminal command logs (TTL 7 days)."""
+def init_audit_db() -> bool:
+    """Create a small table for terminal command logs (TTL 7 days).
+
+    Returns True when the table exists / was ensured.
+    """
     conn = get_db_connection()
     if not conn:
-        return
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS terminal_command_log (
-          id BIGSERIAL PRIMARY KEY,
-          ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          command TEXT NOT NULL,
-          cwd TEXT,
-          exit_code INTEGER,
-          duration_ms INTEGER,
-          raw JSONB
-        );
-        """
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS terminal_command_log (
+              id BIGSERIAL PRIMARY KEY,
+              ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              command TEXT NOT NULL,
+              cwd TEXT,
+              exit_code INTEGER,
+              duration_ms INTEGER,
+              raw JSONB
+            );
+            """
+        )
+        conn.commit()
+        cur.close()
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to init audit DB table: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        conn.close()
 
 
 def cleanup_audit_db(days: int = 7):
+    """TTL cleanup.
+
+    Guard against the table not existing yet (e.g., DB was unavailable at startup).
+    """
     conn = get_db_connection()
     if not conn:
         return
-    cur = conn.cursor()
-    cur.execute("DELETE FROM terminal_command_log WHERE ts < NOW() - (%s || ' days')::interval", (str(days),))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM terminal_command_log WHERE ts < NOW() - (%s || ' days')::interval",
+            (str(days),),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        logger.warning(f"Audit cleanup skipped/failed: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
 
 
 # =============================================================================
