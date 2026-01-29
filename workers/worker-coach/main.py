@@ -18,6 +18,7 @@ import os
 import time
 import logging
 import datetime as dt
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import schedule
@@ -28,8 +29,40 @@ import decimal
 import threading
 
 
+class _RedactTelegramBotToken(logging.Filter):
+    """Best-effort redaction for Telegram bot tokens that may appear in URLs.
+
+    Example patterns:
+      https://api.telegram.org/bot<token>/getUpdates
+    """
+
+    _re = re.compile(r"(bot)(\d+:[A-Za-z0-9_-]+)")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        if not msg:
+            return True
+        redacted = self._re.sub(r"\1***REDACTED***", msg)
+        if redacted != msg:
+            # Override message/args so formatters print the redacted text
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 logger = logging.getLogger("worker-coach")
+
+# Avoid leaking bot token via httpx request logs (INFO-level includes full URL).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Add redaction filter to all root handlers.
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_RedactTelegramBotToken())
 
 TZ = os.getenv("TZ", "Asia/Seoul")
 TELEGRAM_BOT_TOKEN = os.getenv("COACH_TELEGRAM_BOT_TOKEN")
@@ -908,12 +941,23 @@ def _telegram_bot_loop():
             # noop
             return
 
+    from telegram.error import NetworkError
+
+    async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Downgrade transient network errors to warning to avoid noisy log_alert.
+        err = getattr(context, "error", None)
+        if isinstance(err, NetworkError):
+            logger.warning(f"Telegram polling network error (will retry): {err}")
+            return
+        logger.exception("Unhandled telegram bot error", exc_info=err)
+
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("weekly_coach_plan", cmd_weekly))
     app.add_handler(CommandHandler("confirm_weekly_plan", cmd_confirm))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     logger.info("Coach bot polling started")
     app.run_polling()
