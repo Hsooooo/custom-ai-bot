@@ -670,7 +670,10 @@ def main():
     init_db()
     
     # Schedule
-    schedule.every(4).hours.do(run_sync)
+    # Default: every 4 hours (240 minutes). Make it configurable for quicker post-workout sync.
+    sync_interval_min = int(os.getenv("GARMIN_SYNC_INTERVAL_MIN", "240"))
+    schedule.every(sync_interval_min).minutes.do(run_sync)
+    logger.info(f"Scheduled Garmin sync every {sync_interval_min} minutes")
     
     # Run once on startup
     run_sync()

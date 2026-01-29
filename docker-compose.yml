@@ -60,6 +60,8 @@ services:
       - TZ=${TZ}
       - GARMIN_EMAIL=${GARMIN_EMAIL}
       - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      # Sync cadence (minutes). Default in code is 240 (4h). Lower this for faster post-workout ingestion.
+      - GARMIN_SYNC_INTERVAL_MIN=${GARMIN_SYNC_INTERVAL_MIN:-30}
       - POSTGRES_HOST=postgres
       - POSTGRES_USER=${POSTGRES_USER}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -121,13 +123,25 @@ services:
   worker-monitor:
     build: ./workers/worker-monitor
     restart: unless-stopped
+    depends_on:
+      - postgres
     environment:
       - TZ=${TZ}
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      # Send alerts via the cron/monitor bot (override if needed)
+      - ALERT_TELEGRAM_BOT_TOKEN=${ALERT_TELEGRAM_BOT_TOKEN:-${TELEGRAM_BOT_TOKEN}}
       - TELEGRAM_ADMIN_ID=${TELEGRAM_ADMIN_ID}
       - DISK_THRESHOLD_PERCENT=${DISK_THRESHOLD_PERCENT:-85}
       - MEMORY_THRESHOLD_PERCENT=${MEMORY_THRESHOLD_PERCENT:-85}
       - CONTAINER_RESTART_THRESHOLD=${CONTAINER_RESTART_THRESHOLD:-3}
+      # Log watcher
+      - LOG_WATCH_CONTAINERS=${LOG_WATCH_CONTAINERS:-custom-ai-bot-worker-garmin-1,custom-ai-bot-worker-coach-1}
+      - LOG_WATCH_POLL_SEC=${LOG_WATCH_POLL_SEC:-60}
+      - LOG_WATCH_COOLDOWN_SEC=${LOG_WATCH_COOLDOWN_SEC:-600}
+      # Postgres for audit log TTL cleanup (table created by worker-monitor)
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # To monitor docker containers
     networks:
