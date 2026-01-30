@@ -60,6 +60,12 @@ logger = logging.getLogger("worker-coach")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
+# Telegram polling can emit transient network errors at ERROR level via internal Updater logs.
+# We handle these errors and want to avoid noisy alerts.
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Updater").setLevel(logging.WARNING)
+
 # Add redaction filter to all root handlers.
 for _h in logging.getLogger().handlers:
     _h.addFilter(_RedactTelegramBotToken())
