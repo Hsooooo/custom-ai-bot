@@ -14,7 +14,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432" # Optional: Expose if you want to connect from local host
+      - "127.0.0.1:5432:5432" # Localhost only (use SSH port-forward / pgweb)
     networks:
       - clawd_net
 
