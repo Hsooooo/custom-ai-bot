@@ -167,6 +167,29 @@ services:
     networks:
       - clawd_net
 
+  # ---------------------------------------------------------------------------
+  # Admin UI (local-only via SSH port-forward)
+  # ---------------------------------------------------------------------------
+  pgweb:
+    image: sosedoff/pgweb:0.15.0
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      # Connection string used by pgweb
+      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+    # Bind to localhost only (NOT publicly exposed)
+    ports:
+      - "127.0.0.1:${PGWEB_PORT:-8081}:8081"
+    command:
+      - "pgweb"
+      - "--bind=0.0.0.0"
+      - "--listen=8081"
+      - "--auth-user=${PGWEB_USER:-admin}"
+      - "--auth-pass=${PGWEB_PASS:-change-me}"
+    networks:
+      - clawd_net
+
 volumes:
   postgres_data:
   redis_data:
