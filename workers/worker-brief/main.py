@@ -399,15 +399,15 @@ def main():
     # Wait for other services
     time.sleep(15)
 
-    # Schedule morning briefing at 7:00 AM
-    schedule.every().day.at("07:00").do(run_briefing)
+    # Schedule morning briefing at 10:00 AM
+    schedule.every().day.at("10:00").do(run_briefing)
 
     # Also schedule an evening summary at 22:00
     # Note: Garmin sync may complete slightly after 22:00 depending on runtime; sleep section
     # will fall back to yesterday with an explicit note if today's row isn't available yet.
     schedule.every().day.at("22:00").do(run_briefing)
 
-    logger.info("Scheduled briefings: 07:00, 22:00")
+    logger.info("Scheduled briefings: 10:00, 22:00")
 
     # For testing: send briefing on startup if it's between 6-8 AM or 21-23
     tz = pytz.timezone(TZ)
