@@ -190,6 +190,24 @@ services:
     networks:
       - clawd_net
 
+  readonly-dashboard:
+    build:
+      context: .
+      dockerfile: tools/readonly-dashboard/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - RO_DASH_TITLE=custom-ai-bot (read-only)
+    ports:
+      - "127.0.0.1:${RO_DASH_PORT:-8090}:8090"
+    networks:
+      - clawd_net
+
 volumes:
   postgres_data:
   redis_data:
