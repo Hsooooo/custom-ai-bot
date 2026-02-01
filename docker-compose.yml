@@ -134,7 +134,7 @@ services:
       - MEMORY_THRESHOLD_PERCENT=${MEMORY_THRESHOLD_PERCENT:-85}
       - CONTAINER_RESTART_THRESHOLD=${CONTAINER_RESTART_THRESHOLD:-3}
       # Log watcher
-      - LOG_WATCH_CONTAINERS=${LOG_WATCH_CONTAINERS:-custom-ai-bot-worker-garmin-1,custom-ai-bot-worker-coach-1}
+      - LOG_WATCH_CONTAINERS=${LOG_WATCH_CONTAINERS:-custom-ai-bot-worker-garmin-1}
       - LOG_WATCH_POLL_SEC=${LOG_WATCH_POLL_SEC:-60}
       - LOG_WATCH_COOLDOWN_SEC=${LOG_WATCH_COOLDOWN_SEC:-600}
       # Postgres for audit log TTL cleanup (table created by worker-monitor)
