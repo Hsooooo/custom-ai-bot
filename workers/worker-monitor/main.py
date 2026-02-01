@@ -26,6 +26,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger('worker-monitor')
 
+# Avoid leaking full request URLs in INFO logs (Telegram bot token can appear in URLs)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Environment Variables
 # Default alert channel: Telegram DM to admin via a dedicated bot token.
 # If ALERT_TELEGRAM_BOT_TOKEN is set, it overrides TELEGRAM_BOT_TOKEN.
@@ -44,6 +48,11 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
 DISK_THRESHOLD_PERCENT = int(os.getenv("DISK_THRESHOLD_PERCENT", "85"))
 MEMORY_THRESHOLD_PERCENT = int(os.getenv("MEMORY_THRESHOLD_PERCENT", "85"))
 CONTAINER_RESTART_THRESHOLD = int(os.getenv("CONTAINER_RESTART_THRESHOLD", "3"))
+
+# Ignore containers that are intentionally stopped (comma-separated docker container names)
+MONITOR_IGNORE_CONTAINERS = [
+    x.strip() for x in os.getenv("MONITOR_IGNORE_CONTAINERS", "").split(",") if x.strip()
+]
 
 # Alert cooldown (seconds) - don't spam alerts
 ALERT_COOLDOWN = 3600  # 1 hour
@@ -139,6 +148,8 @@ def check_container_health() -> List[str]:
     
     for container in containers:
         name = container['name']
+        if name in MONITOR_IGNORE_CONTAINERS:
+            continue
         
         # Check if container is stopped/exited
         if container['status'] in ['exited', 'dead']:
@@ -235,6 +246,8 @@ def generate_health_report() -> str:
     
     if containers:
         for c in containers:
+            if c['name'] in MONITOR_IGNORE_CONTAINERS:
+                continue
             status_emoji = {
                 'running': '🟢',
                 'exited': '🔴',

@@ -137,6 +137,8 @@ services:
       - LOG_WATCH_CONTAINERS=${LOG_WATCH_CONTAINERS:-custom-ai-bot-worker-garmin-1}
       - LOG_WATCH_POLL_SEC=${LOG_WATCH_POLL_SEC:-60}
       - LOG_WATCH_COOLDOWN_SEC=${LOG_WATCH_COOLDOWN_SEC:-600}
+      # Health check: containers intentionally stopped should not alert
+      - MONITOR_IGNORE_CONTAINERS=${MONITOR_IGNORE_CONTAINERS:-custom-ai-bot-worker-coach-1}
       # Postgres for audit log TTL cleanup (table created by worker-monitor)
       - POSTGRES_HOST=postgres
       - POSTGRES_DB=${POSTGRES_DB}
