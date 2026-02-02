@@ -122,6 +122,8 @@ custom-ai-bot/
 
 ## Quick Start
 
+> 보안: 이 프로젝트는 Telegram/Garmin/GitHub/OpenAI 등 자격증명이 필요합니다. **실제 토큰/비밀번호를 README나 커밋에 남기지 말고**, `.env.example`을 템플릿으로 써서 `.env`/서버 환경변수로만 주입하세요.
+
 ### 1. Clone & Configure
 
 ```bash
